@@ -49,6 +49,51 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const LOCK_FILE = join(STATE_DIR, 'polling.lock')
+
+// Polling lock — prevents multiple instances from fighting over the same bot
+// token (causes 409 Conflict from Telegram). The lock file contains the PID.
+// If the PID is still alive, this instance runs in tools-only mode (can still
+// reply/react/edit, but won't poll for inbound messages).
+let pollingEnabled = true
+
+function acquirePollingLock(): boolean {
+  try {
+    // Check if another instance holds the lock.
+    const existing = readFileSync(LOCK_FILE, 'utf8').trim()
+    const pid = Number(existing)
+    if (pid && pid !== process.pid) {
+      try {
+        process.kill(pid, 0) // signal 0 = check if alive
+        // Process is alive — we can't poll.
+        return false
+      } catch {
+        // Process is dead — stale lock, we can take over.
+      }
+    }
+  } catch {
+    // No lock file — we're first.
+  }
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  writeFileSync(LOCK_FILE, String(process.pid), { mode: 0o600 })
+  return true
+}
+
+function releasePollingLock(): void {
+  try {
+    const existing = readFileSync(LOCK_FILE, 'utf8').trim()
+    if (Number(existing) === process.pid) {
+      rmSync(LOCK_FILE, { force: true })
+    }
+  } catch {}
+}
+
+pollingEnabled = acquirePollingLock()
+if (!pollingEnabled) {
+  process.stderr.write(
+    'telegram channel: another instance is polling — running in tools-only mode\n',
+  )
+}
 
 const bot = new Bot(TOKEN)
 let botUsername = ''
@@ -303,7 +348,7 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000)
+if (!STATIC && pollingEnabled) setInterval(checkApprovals, 5000)
 
 // Telegram caps messages at 4096 chars. Split long replies, preferring
 // paragraph boundaries when chunkMode is 'newline'.
@@ -799,6 +844,71 @@ function clearResponseTimer(chat_id: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Message batching — when a user sends multiple messages quickly (e.g. typing
+// across 3 messages in 2 seconds), debounce them into a single notification
+// to Claude. Prevents Claude from receiving 3 separate context switches.
+// ---------------------------------------------------------------------------
+type QueuedMessage = {
+  ctx: Context
+  text: string
+  downloadImage: (() => Promise<string | undefined>) | undefined
+  attachments?: AttachmentMeta[]
+}
+const messageQueue = new Map<string, { messages: QueuedMessage[]; timer: ReturnType<typeof setTimeout> }>()
+const BATCH_DELAY_MS = 1500 // wait 1.5s for more messages before delivering
+
+function enqueueMessage(chat_id: string, msg: QueuedMessage): void {
+  let entry = messageQueue.get(chat_id)
+  if (entry) {
+    clearTimeout(entry.timer)
+    entry.messages.push(msg)
+  } else {
+    entry = { messages: [msg], timer: setTimeout(() => {}, 0) }
+    messageQueue.set(chat_id, entry)
+  }
+
+  entry.timer = setTimeout(() => {
+    const batch = messageQueue.get(chat_id)
+    messageQueue.delete(chat_id)
+    if (!batch) return
+    void flushBatch(chat_id, batch.messages)
+  }, BATCH_DELAY_MS)
+}
+
+async function flushBatch(chat_id: string, messages: QueuedMessage[]): Promise<void> {
+  if (messages.length === 0) return
+
+  if (messages.length === 1) {
+    // Single message — deliver normally.
+    await handleInbound(
+      messages[0].ctx,
+      messages[0].text,
+      messages[0].downloadImage,
+      messages[0].attachments,
+    )
+    return
+  }
+
+  // Multiple messages — merge texts, combine attachments, use last ctx.
+  const lastMsg = messages[messages.length - 1]
+  const combinedText = messages.map(m => m.text).join('\n')
+  const allAttachments: AttachmentMeta[] = []
+  let firstImageDownload: (() => Promise<string | undefined>) | undefined
+
+  for (const m of messages) {
+    if (m.downloadImage && !firstImageDownload) firstImageDownload = m.downloadImage
+    if (m.attachments) allAttachments.push(...m.attachments)
+  }
+
+  await handleInbound(
+    lastMsg.ctx,
+    combinedText,
+    firstImageDownload,
+    allAttachments.length > 0 ? allAttachments : undefined,
+  )
+}
+
 function storePendingAttachment(msgId: string, atts: PendingAttachment[]): void {
   pendingAttachments.set(msgId, atts)
   if (pendingAttachments.size > PENDING_ATT_CAP) {
@@ -808,23 +918,88 @@ function storePendingAttachment(msgId: string, atts: PendingAttachment[]): void 
   }
 }
 
-bot.on('message:text', async ctx => {
-  await handleInbound(ctx, ctx.message.text, undefined)
+// ---------------------------------------------------------------------------
+// Bot commands — /start, /help, /status. These respond directly in Telegram
+// without going through the gate or notifying Claude.
+// ---------------------------------------------------------------------------
+
+bot.command('start', async ctx => {
+  const name = ctx.from?.first_name ?? 'there'
+  await ctx.reply(
+    `Hi ${name}! 👋\n\n` +
+    `I'm a bridge between Telegram and Claude Code.\n\n` +
+    `To get started:\n` +
+    `1. Run Claude Code with --channels flag\n` +
+    `2. Send me a message here\n` +
+    `3. I'll give you a pairing code\n` +
+    `4. Run /telegram:access pair <code> in Claude Code\n\n` +
+    `Commands:\n` +
+    `/help — show available commands\n` +
+    `/status — check connection status`,
+  )
 })
 
-bot.on('message:photo', async ctx => {
+bot.command('help', async ctx => {
+  await ctx.reply(
+    `Available commands:\n\n` +
+    `/start — welcome message and setup guide\n` +
+    `/help — this message\n` +
+    `/status — check if Claude Code is connected\n\n` +
+    `Just send a message to talk to Claude. ` +
+    `Photos are auto-downloaded. Documents, voice, video — ` +
+    `Claude will download them when needed.`,
+  )
+})
+
+bot.command('status', async ctx => {
+  const chat_id = String(ctx.chat.id)
+  const access = loadAccess()
+  const isAllowed = access.allowFrom.includes(String(ctx.from?.id))
+  const hasPending = Object.values(access.pending).some(
+    p => p.senderId === String(ctx.from?.id),
+  )
+  const historyCount = messageHistory.get(chat_id)?.length ?? 0
+
+  let status: string
+  if (isAllowed) {
+    status = '✅ Paired and active'
+  } else if (hasPending) {
+    status = '⏳ Pairing pending — run the pair command in Claude Code'
+  } else {
+    status = '❌ Not paired — send a message to start pairing'
+  }
+
+  await ctx.reply(
+    `Status: ${status}\n` +
+    `Bot: @${botUsername || '(starting...)'}\n` +
+    `Polling: ${pollingEnabled ? 'active' : 'tools-only mode'}\n` +
+    `Messages buffered: ${historyCount}`,
+  )
+})
+
+bot.on('message:text', ctx => {
+  // Skip commands — they're handled above.
+  if (ctx.message.text.startsWith('/')) return
+  const chat_id = String(ctx.chat!.id)
+  enqueueMessage(chat_id, { ctx, text: ctx.message.text, downloadImage: undefined })
+})
+
+bot.on('message:photo', ctx => {
   const caption = ctx.message.caption ?? '(photo)'
   const photos = ctx.message.photo
   const best = photos[photos.length - 1]
-  // Photos auto-download (they're visual context Claude needs immediately).
-  await handleInbound(ctx, caption, () => downloadTelegramFile(best.file_id, best.file_unique_id, 'jpg'))
+  const chat_id = String(ctx.chat!.id)
+  enqueueMessage(chat_id, {
+    ctx,
+    text: caption,
+    downloadImage: () => downloadTelegramFile(best.file_id, best.file_unique_id, 'jpg'),
+  })
 })
 
-bot.on('message:document', async ctx => {
+bot.on('message:document', ctx => {
   const doc = ctx.message.document
   const caption = ctx.message.caption ?? `(document: ${doc.file_name ?? 'file'})`
   const msgId = String(ctx.message.message_id)
-  // Store for on-demand download via download_attachment tool.
   storePendingAttachment(msgId, [{
     file_id: doc.file_id,
     unique_id: doc.file_unique_id,
@@ -833,14 +1008,15 @@ bot.on('message:document', async ctx => {
     file_size: doc.file_size,
     mime_type: doc.mime_type ?? undefined,
   }])
-  await handleInbound(ctx, caption, undefined, [{
+  const chat_id = String(ctx.chat!.id)
+  enqueueMessage(chat_id, { ctx, text: caption, downloadImage: undefined, attachments: [{
     name: doc.file_name ?? 'document',
     type: doc.mime_type ?? 'unknown',
     size: doc.file_size ?? 0,
-  }])
+  }] })
 })
 
-bot.on('message:voice', async ctx => {
+bot.on('message:voice', ctx => {
   const voice = ctx.message.voice
   const msgId = String(ctx.message.message_id)
   storePendingAttachment(msgId, [{
@@ -850,14 +1026,15 @@ bot.on('message:voice', async ctx => {
     file_size: voice.file_size,
     mime_type: voice.mime_type ?? 'audio/ogg',
   }])
-  await handleInbound(ctx, '(voice message)', undefined, [{
+  const chat_id = String(ctx.chat!.id)
+  enqueueMessage(chat_id, { ctx, text: '(voice message)', downloadImage: undefined, attachments: [{
     name: 'voice.ogg',
     type: voice.mime_type ?? 'audio/ogg',
     size: voice.file_size ?? 0,
-  }])
+  }] })
 })
 
-bot.on('message:video', async ctx => {
+bot.on('message:video', ctx => {
   const video = ctx.message.video
   const caption = ctx.message.caption ?? '(video)'
   const msgId = String(ctx.message.message_id)
@@ -869,14 +1046,15 @@ bot.on('message:video', async ctx => {
     file_size: video.file_size,
     mime_type: video.mime_type ?? 'video/mp4',
   }])
-  await handleInbound(ctx, caption, undefined, [{
+  const chat_id = String(ctx.chat!.id)
+  enqueueMessage(chat_id, { ctx, text: caption, downloadImage: undefined, attachments: [{
     name: video.file_name ?? 'video.mp4',
     type: video.mime_type ?? 'video/mp4',
     size: video.file_size ?? 0,
-  }])
+  }] })
 })
 
-bot.on('message:video_note', async ctx => {
+bot.on('message:video_note', ctx => {
   const vn = ctx.message.video_note
   const msgId = String(ctx.message.message_id)
   storePendingAttachment(msgId, [{
@@ -886,11 +1064,12 @@ bot.on('message:video_note', async ctx => {
     file_size: vn.file_size,
     mime_type: 'video/mp4',
   }])
-  await handleInbound(ctx, '(video note)', undefined, [{
+  const chat_id = String(ctx.chat!.id)
+  enqueueMessage(chat_id, { ctx, text: '(video note)', downloadImage: undefined, attachments: [{
     name: 'video_note.mp4',
     type: 'video/mp4',
     size: vn.file_size ?? 0,
-  }])
+  }] })
 })
 
 bot.on('message:audio', async ctx => {
@@ -905,17 +1084,19 @@ bot.on('message:audio', async ctx => {
     file_size: audio.file_size,
     mime_type: audio.mime_type ?? 'audio/mpeg',
   }])
-  await handleInbound(ctx, caption, undefined, [{
+  const chat_id = String(ctx.chat!.id)
+  enqueueMessage(chat_id, { ctx, text: caption, downloadImage: undefined, attachments: [{
     name: audio.file_name ?? 'audio.mp3',
     type: audio.mime_type ?? 'audio/mpeg',
     size: audio.file_size ?? 0,
-  }])
+  }] })
 })
 
-bot.on('message:sticker', async ctx => {
+bot.on('message:sticker', ctx => {
   const sticker = ctx.message.sticker
   const emoji = sticker.emoji ? ` ${sticker.emoji}` : ''
-  await handleInbound(ctx, `(sticker${emoji}: ${sticker.set_name ?? 'custom'})`, undefined)
+  const chat_id = String(ctx.chat!.id)
+  enqueueMessage(chat_id, { ctx, text: `(sticker${emoji}: ${sticker.set_name ?? 'custom'})`, downloadImage: undefined })
 })
 
 type AttachmentMeta = { name: string; type: string; size: number }
@@ -1085,16 +1266,43 @@ process.on('unhandledRejection', (reason: unknown) => {
 })
 
 // 5. Graceful shutdown — clean up intervals and stop polling on SIGTERM/SIGINT.
+let shuttingDown = false
 function shutdown(): void {
+  if (shuttingDown) return // prevent double shutdown
+  shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
   for (const interval of activeTyping.values()) clearInterval(interval)
   activeTyping.clear()
   for (const pending of pendingResponses.values()) clearInterval(pending.timer)
   pendingResponses.clear()
+  releasePollingLock()
   void bot.stop()
+  // Give bot.stop() a moment to clean up, then force exit.
+  setTimeout(() => process.exit(0), 2000)
 }
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
-// Launch.
-void startWithReconnect()
+// 6. Zombie process prevention — when Claude Code ends the session, the MCP
+//    stdio transport closes. Without this, bot.start() keeps polling Telegram
+//    indefinitely as a zombie process. Detect stdin close and shut down.
+process.stdin.on('end', () => {
+  process.stderr.write('telegram channel: stdin closed (MCP disconnected), shutting down\n')
+  shutdown()
+})
+process.stdin.on('error', () => {
+  shutdown()
+})
+
+// Launch — only poll if we hold the lock, otherwise tools-only mode.
+if (pollingEnabled) {
+  void startWithReconnect()
+} else {
+  // In tools-only mode, we still need the bot username for outbound messages.
+  bot.api.getMe().then(me => {
+    botUsername = me.username
+    process.stderr.write(`telegram channel: tools-only mode as @${me.username}\n`)
+  }).catch(err => {
+    process.stderr.write(`telegram channel: failed to get bot info: ${err}\n`)
+  })
+}
