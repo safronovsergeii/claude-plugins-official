@@ -537,6 +537,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         clearTyping(chat_id)
+        clearResponseTimer(chat_id)
 
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
@@ -740,6 +741,64 @@ function clearTyping(chat_id: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Stale response detection — notify user when Claude is taking too long,
+// likely stuck on a permission prompt in the terminal.
+// ---------------------------------------------------------------------------
+type PendingResponse = {
+  startedAt: number
+  notifiedAt30: boolean
+  notifiedAt90: boolean
+  timer: ReturnType<typeof setInterval>
+}
+const pendingResponses = new Map<string, PendingResponse>()
+
+const STALE_CHECK_INTERVAL = 5000     // check every 5s
+const STALE_WARN_SECONDS = 30         // "still working" at 30s
+const STALE_ESCALATE_SECONDS = 90     // "may need terminal approval" at 90s
+const STALE_EXPIRE_SECONDS = 300      // stop checking after 5 min
+
+function startResponseTimer(chat_id: string): void {
+  // Clear any existing timer for this chat.
+  clearResponseTimer(chat_id)
+
+  const pending: PendingResponse = {
+    startedAt: Date.now(),
+    notifiedAt30: false,
+    notifiedAt90: false,
+    timer: setInterval(() => {
+      const elapsed = (Date.now() - pending.startedAt) / 1000
+
+      if (elapsed >= STALE_EXPIRE_SECONDS) {
+        clearResponseTimer(chat_id)
+        return
+      }
+
+      if (!pending.notifiedAt30 && elapsed >= STALE_WARN_SECONDS) {
+        pending.notifiedAt30 = true
+        void bot.api.sendMessage(chat_id, '⏳ Still working on your request...').catch(() => {})
+      }
+
+      if (!pending.notifiedAt90 && elapsed >= STALE_ESCALATE_SECONDS) {
+        pending.notifiedAt90 = true
+        void bot.api.sendMessage(
+          chat_id,
+          '⚠️ This is taking longer than usual — Claude may be waiting for permission approval in your terminal.',
+        ).catch(() => {})
+      }
+    }, STALE_CHECK_INTERVAL),
+  }
+  pendingResponses.set(chat_id, pending)
+}
+
+function clearResponseTimer(chat_id: string): void {
+  const pending = pendingResponses.get(chat_id)
+  if (pending) {
+    clearInterval(pending.timer)
+    pendingResponses.delete(chat_id)
+  }
+}
+
 function storePendingAttachment(msgId: string, atts: PendingAttachment[]): void {
   pendingAttachments.set(msgId, atts)
   if (pendingAttachments.size > PENDING_ATT_CAP) {
@@ -893,6 +952,9 @@ async function handleInbound(
   }, 4000)
   activeTyping.set(chat_id, typingInterval)
 
+  // Start stale response timer — will notify user if Claude takes too long.
+  startResponseTimer(chat_id)
+
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
   // something outside that set the API rejects it and we swallow.
@@ -1027,6 +1089,8 @@ function shutdown(): void {
   process.stderr.write('telegram channel: shutting down\n')
   for (const interval of activeTyping.values()) clearInterval(interval)
   activeTyping.clear()
+  for (const pending of pendingResponses.values()) clearInterval(pending.timer)
+  pendingResponses.clear()
   void bot.stop()
 }
 process.on('SIGTERM', shutdown)

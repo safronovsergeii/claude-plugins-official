@@ -109,3 +109,4 @@ The bot includes several layers of error recovery:
 - **Middleware error handler** — errors in message processing are logged, not crashed. The bot continues accepting messages.
 - **Process safety nets** — uncaught exceptions and unhandled rejections are logged instead of killing the process.
 - **Graceful shutdown** — SIGTERM/SIGINT cleanly stop polling and clear resources.
+- **Stale response detection** — if Claude hasn't replied within 30 seconds, the bot sends a "still working" message. At 90 seconds it warns that Claude may be waiting for permission approval in the terminal. Clears automatically when a reply is sent.
