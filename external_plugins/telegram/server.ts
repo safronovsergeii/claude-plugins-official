@@ -944,9 +944,93 @@ async function handleInbound(
   })
 }
 
-void bot.start({
-  onStart: info => {
-    botUsername = info.username
-    process.stderr.write(`telegram channel: polling as @${info.username}\n`)
-  },
+// ---------------------------------------------------------------------------
+// Resilience: error handling, auto-reconnect, graceful shutdown
+// ---------------------------------------------------------------------------
+
+// 1. Middleware error handler — prevents unhandled middleware errors from
+//    crashing the process. Logs and continues.
+bot.catch(err => {
+  process.stderr.write(`telegram channel: middleware error: ${err.message ?? err}\n`)
 })
+
+// 2. API retry transformer — retries on 429 (rate limit) and 5xx (server error)
+//    with exponential backoff. Max 3 attempts.
+bot.api.config.use(async (prev, method, payload, signal) => {
+  const MAX_RETRIES = 3
+  let lastError: unknown
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      return await prev(method, payload, signal)
+    } catch (err: unknown) {
+      lastError = err
+      const msg = err instanceof Error ? err.message : String(err)
+      const isRetryable =
+        msg.includes('429') ||
+        msg.includes('500') ||
+        msg.includes('502') ||
+        msg.includes('503') ||
+        msg.includes('ETIMEDOUT') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('fetch failed')
+      if (!isRetryable || attempt === MAX_RETRIES - 1) throw err
+      const delay = Math.min(1000 * 2 ** attempt, 10000)
+      process.stderr.write(
+        `telegram channel: API ${method} failed (${msg}), retry ${attempt + 1}/${MAX_RETRIES} in ${delay}ms\n`,
+      )
+      await new Promise(r => setTimeout(r, delay))
+    }
+  }
+  throw lastError
+})
+
+// 3. Auto-reconnect polling — if bot.start() rejects (network loss, Telegram
+//    outage), wait and retry with exponential backoff. Caps at 60s.
+async function startWithReconnect(): Promise<void> {
+  let backoff = 1000
+  const MAX_BACKOFF = 60000
+
+  while (true) {
+    try {
+      await bot.start({
+        onStart: info => {
+          botUsername = info.username
+          backoff = 1000 // reset on successful connect
+          process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+        },
+      })
+      // bot.start() resolves when bot.stop() is called — normal shutdown.
+      return
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(
+        `telegram channel: polling crashed (${msg}), reconnecting in ${backoff / 1000}s\n`,
+      )
+      await new Promise(r => setTimeout(r, backoff))
+      backoff = Math.min(backoff * 2, MAX_BACKOFF)
+    }
+  }
+}
+
+// 4. Process-level safety nets — catch truly unhandled errors instead of
+//    crashing. Log and continue — the bot's event loop stays alive.
+process.on('uncaughtException', err => {
+  process.stderr.write(`telegram channel: uncaught exception: ${err.message ?? err}\n`)
+})
+process.on('unhandledRejection', (reason: unknown) => {
+  const msg = reason instanceof Error ? reason.message : String(reason)
+  process.stderr.write(`telegram channel: unhandled rejection: ${msg}\n`)
+})
+
+// 5. Graceful shutdown — clean up intervals and stop polling on SIGTERM/SIGINT.
+function shutdown(): void {
+  process.stderr.write('telegram channel: shutting down\n')
+  for (const interval of activeTyping.values()) clearInterval(interval)
+  activeTyping.clear()
+  void bot.stop()
+}
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)
+
+// Launch.
+void startWithReconnect()

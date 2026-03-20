@@ -99,3 +99,13 @@ Telegram's Bot API has no server-side message history endpoint. The bot
 buffers messages in memory as they arrive (up to 100 per chat). Use
 `fetch_messages` to retrieve them — both inbound messages and the bot's own
 replies are included. The buffer resets when the bot restarts.
+
+## Resilience
+
+The bot includes several layers of error recovery:
+
+- **Auto-reconnect** — if Telegram long polling crashes (network loss, API outage), the bot reconnects automatically with exponential backoff (1s → 2s → 4s → ... → 60s max). Backoff resets on successful reconnect.
+- **API retry** — outbound API calls (reply, react, edit) automatically retry on rate limits (429), server errors (5xx), and network failures (ETIMEDOUT, ECONNRESET). Up to 3 attempts with exponential backoff.
+- **Middleware error handler** — errors in message processing are logged, not crashed. The bot continues accepting messages.
+- **Process safety nets** — uncaught exceptions and unhandled rejections are logged instead of killing the process.
+- **Graceful shutdown** — SIGTERM/SIGINT cleanly stop polling and clear resources.
