@@ -583,6 +583,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         clearTyping(chat_id)
         clearResponseTimer(chat_id)
+        // Don't cancel idle timer here — we START it after sending.
 
         const access = loadAccess()
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
@@ -647,6 +648,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             is_bot: true,
           })
         }
+
+        // Start idle timer — if no new reply comes within IDLE_SECONDS,
+        // notify the user that Claude has finished working.
+        startIdleTimer(chat_id)
 
         const result =
           sentIds.length === 1
@@ -841,6 +846,53 @@ function clearResponseTimer(chat_id: string): void {
   if (pending) {
     clearInterval(pending.timer)
     pendingResponses.delete(chat_id)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Task completion detection — notify the user in Telegram when Claude finishes
+// working. After the reply tool sends a message, an idle timer starts. If no
+// new reply tool call happens within IDLE_SECONDS, Claude is considered done
+// and a completion notification is sent. This solves the "babysitting" problem:
+// users can walk away and get a push notification when work is finished.
+// ---------------------------------------------------------------------------
+type IdleTracker = {
+  timer: ReturnType<typeof setTimeout>
+  replyCount: number
+}
+const idleTrackers = new Map<string, IdleTracker>()
+
+const IDLE_SECONDS = 15 // seconds of silence after last reply = task done
+
+function startIdleTimer(chat_id: string): void {
+  const existing = idleTrackers.get(chat_id)
+  if (existing) {
+    clearTimeout(existing.timer)
+    existing.replyCount++
+  }
+
+  const tracker: IdleTracker = {
+    replyCount: existing?.replyCount ?? 1,
+    timer: setTimeout(() => {
+      const t = idleTrackers.get(chat_id)
+      idleTrackers.delete(chat_id)
+      if (!t || t.replyCount < 1) return
+
+      // Only notify if Claude sent at least one reply (not just a reaction).
+      void bot.api.sendMessage(
+        chat_id,
+        '✅ Done — Claude has finished working. Send a new message when you need something else.',
+      ).catch(() => {})
+    }, IDLE_SECONDS * 1000),
+  }
+  idleTrackers.set(chat_id, tracker)
+}
+
+function cancelIdleTimer(chat_id: string): void {
+  const existing = idleTrackers.get(chat_id)
+  if (existing) {
+    clearTimeout(existing.timer)
+    idleTrackers.delete(chat_id)
   }
 }
 
@@ -1136,6 +1188,9 @@ async function handleInbound(
   // Start stale response timer — will notify user if Claude takes too long.
   startResponseTimer(chat_id)
 
+  // Cancel any idle timer — new message means a new task is starting.
+  cancelIdleTimer(chat_id)
+
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
   // something outside that set the API rejects it and we swallow.
@@ -1275,6 +1330,8 @@ function shutdown(): void {
   activeTyping.clear()
   for (const pending of pendingResponses.values()) clearInterval(pending.timer)
   pendingResponses.clear()
+  for (const tracker of idleTrackers.values()) clearTimeout(tracker.timer)
+  idleTrackers.clear()
   releasePollingLock()
   void bot.stop()
   // Give bot.stop() a moment to clean up, then force exit.
